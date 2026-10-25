@@ -508,6 +508,15 @@ impl PackInfo {
     }
 }
 
+// Preserve the first worker error without panicking or erasing its context.
+// Rayon waits for all scoped workers before restore_contents inspects the slot.
+fn record_restore_error(slot: &Mutex<Option<Box<RusticError>>>, err: Box<RusticError>) {
+    let mut guard = slot.lock().expect("restore error mutex poisoned");
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
 /// [`restore_contents`] restores all files contents as described by `file_infos`
 /// using the [`DecryptReadBackend`] `be` and writing them into the [`LocalDestination`] `dest`.
 ///
@@ -596,6 +605,9 @@ fn restore_contents<S: Open>(
             .attach_context("num_threads", threads.to_string())
         })?;
 
+    // A worker must not unwind the restore on routine filesystem or backend
+    // errors: preserve the first failure so callers get a usable Result.
+    let restore_error = Mutex::new(None::<Box<RusticError>>);
     pool.in_place_scope(|s| {
         for PackInfo {
             pack_id,
@@ -609,24 +621,43 @@ fn restore_contents<S: Open>(
         } in packs
         {
             let p = &p;
+            let restore_error = &restore_error;
 
             if !blobs.is_empty() {
-                // TODO: error handling!
                 s.spawn(move |s1| {
                     let read_data = match &from_file {
                         Some((file_idx, offset_file, length_file)) => {
-                            // read from existing file
-                            dest.read_at(&filenames[*file_idx], *offset_file, (*length_file).into())
-                                .unwrap()
+                            let path = &filenames[*file_idx];
+                            match dest.read_at(path, *offset_file, (*length_file).into()) {
+                                Ok(data) => data,
+                                Err(err) => {
+                                    record_restore_error(
+                                        restore_error,
+                                        RusticError::with_source(
+                                            ErrorKind::InputOutput,
+                                            "Failed to read existing restore file `{path}`.",
+                                            err,
+                                        )
+                                        .attach_context("path", path.display().to_string()),
+                                    );
+                                    return;
+                                }
+                            }
                         }
                         None => {
-                            // read needed part of the pack
-                            be.read_partial(FileType::Pack, &pack_id, false, offset, length)
-                                .unwrap()
+                            match be.read_partial(FileType::Pack, &pack_id, false, offset, length) {
+                                Ok(data) => data,
+                                Err(err) => {
+                                    record_restore_error(
+                                        restore_error,
+                                        err.attach_context("pack_id", format!("{pack_id:?}")),
+                                    );
+                                    return;
+                                }
+                            }
                         }
                     };
 
-                    // save into needed files in parallel
                     for (bl, name_dests) in blobs {
                         let size = bl.data_length().into();
                         let data = if from_file.is_some() {
@@ -636,11 +667,27 @@ fn restore_contents<S: Open>(
                                 .expect("convert from u32 to usize should not fail!");
                             let end = usize::try_from(bl.offset + bl.length - offset)
                                 .expect("convert from u32 to usize should not fail!");
-                            be.read_encrypted_from_partial(
-                                &read_data[start..end],
-                                bl.uncompressed_length,
-                            )
-                            .unwrap()
+                            let Some(encrypted) = read_data.get(start..end) else {
+                                record_restore_error(
+                                    restore_error,
+                                    RusticError::new(
+                                        ErrorKind::Verification,
+                                        "The pack data was shorter than the requested encrypted blob.",
+                                    )
+                                    .attach_context("pack_id", format!("{pack_id:?}")),
+                                );
+                                return;
+                            };
+                            match be.read_encrypted_from_partial(encrypted, bl.uncompressed_length) {
+                                Ok(data) => data,
+                                Err(err) => {
+                                    record_restore_error(
+                                        restore_error,
+                                        err.attach_context("pack_id", format!("{pack_id:?}")),
+                                    );
+                                    return;
+                                }
+                            }
                         };
                         let is_sparse = match sparse {
                             SparseRestore::ByContent => data.iter().all(|&b| b == 0),
@@ -651,16 +698,39 @@ fn restore_contents<S: Open>(
                             let data = data.clone();
                             s1.spawn(move |_| {
                                 let path = &filenames[file_idx];
-                                // Allocate file if it is not yet allocated
+                                // Allocate file if it is not yet allocated.
                                 let mut sizes_guard = sizes.lock().unwrap();
                                 let filesize = sizes_guard[file_idx];
                                 if filesize > 0 {
-                                    dest.set_length(path, filesize).unwrap();
+                                    if let Err(err) = dest.set_length(path, filesize) {
+                                        drop(sizes_guard);
+                                        record_restore_error(
+                                            restore_error,
+                                            RusticError::with_source(
+                                                ErrorKind::InputOutput,
+                                                "Failed to set restore file length for `{path}`.",
+                                                err,
+                                            )
+                                            .attach_context("path", path.display().to_string()),
+                                        );
+                                        return;
+                                    }
                                     sizes_guard[file_idx] = 0;
                                 }
                                 drop(sizes_guard);
                                 if !is_sparse {
-                                    dest.write_at(path, start, &data).unwrap();
+                                    if let Err(err) = dest.write_at(path, start, &data) {
+                                        record_restore_error(
+                                            restore_error,
+                                            RusticError::with_source(
+                                                ErrorKind::InputOutput,
+                                                "Failed to write restore file `{path}`.",
+                                                err,
+                                            )
+                                            .attach_context("path", path.display().to_string()),
+                                        );
+                                        return;
+                                    }
                                 }
                                 p.inc(size);
                             });
@@ -672,6 +742,10 @@ fn restore_contents<S: Open>(
     });
 
     p.finish();
+
+    if let Some(err) = restore_error.into_inner().expect("restore error mutex poisoned") {
+        return Err(err);
+    }
 
     Ok(())
 }
