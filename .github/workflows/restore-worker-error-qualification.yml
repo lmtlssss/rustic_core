@@ -1,0 +1,21 @@
+name: Restore worker error propagation qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-restore-worker-io-error-20261025
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify rustfmt source
+        run: cargo fmt --all -- --check
+      - name: Test real archive and unwritable destination error
+        run: cargo test -p rustic_core --test integration test_restore_reports_worker_file_creation_error -- --nocapture
+      - name: Check library API and error types
+        run: cargo check -p rustic_core
