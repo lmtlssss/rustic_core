@@ -58,3 +58,43 @@ fn test_restore_preserves_hardlinks(
 
     Ok(())
 }
+
+#[rstest]
+#[cfg(not(windows))]
+fn test_restore_reports_worker_file_creation_error(
+    tar_gz_testdata: Result<TestSource>,
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
+    let (source, repo) = (tar_gz_testdata?, set_up_repo?.to_indexed_ids()?);
+    let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
+    let _snapshot = repo.backup(&opts, &source.path_list(), SnapshotFile::default())?;
+
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let ls = repo.ls(&node, &LsOptions::default())?;
+
+    let restore_dir = tempdir()?;
+    let dest = LocalDestination::new(
+        restore_dir.path().to_str().expect("valid path"),
+        true,
+        !node.is_dir(),
+    )?;
+    let restore_opts = RestoreOptions::default();
+    let plan = repo.prepare_restore(&restore_opts, ls.clone(), &dest, false)?;
+
+    // Simulate a destination that cannot create this file *after* planning.
+    // Opening a directory as a regular writable file fails deterministically
+    // even when tests run as a privileged user.
+    let conflicting_path = restore_dir.path().join("test/0/tests/testfile");
+    fs::create_dir_all(&conflicting_path)?;
+
+    let err = repo
+        .restore(plan, &restore_opts, ls, &dest)
+        .expect_err("an unwritable restore target must return an error, not panic");
+    assert!(
+        err.to_string().contains("testfile"),
+        "restore error should identify the failed path: {err}"
+    );
+
+    Ok(())
+}
