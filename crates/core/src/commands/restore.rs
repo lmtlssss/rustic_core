@@ -743,7 +743,10 @@ fn restore_contents<S: Open>(
 
     p.finish();
 
-    if let Some(err) = restore_error.into_inner().expect("restore error mutex poisoned") {
+    if let Some(err) = restore_error
+        .into_inner()
+        .expect("restore error mutex poisoned")
+    {
         return Err(err);
     }
 
